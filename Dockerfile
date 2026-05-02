@@ -22,14 +22,16 @@ RUN chmod +x /start.sh
 
 WORKDIR /app
 
-# Palace data and ChromaDB both live under /data (single volume)
-ENV MEMPALACE_PALACE_PATH=/data
-
 # MCP_AUTH_TOKEN: set this to enable Bearer token auth.
 # If unset, the proxy forwards all requests without auth check.
 ENV MCP_AUTH_TOKEN=""
 
-VOLUME ["/data"]
+# All MemPalace data lives under /root/.mempalace:
+#   palace/                  — drawers + ChromaDB vectors
+#   knowledge_graph.sqlite3  — knowledge graph
+#   config.json              — configuration
+#   wal/                     — write-ahead log
+VOLUME ["/root/.mempalace"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8081/')" || exit 1

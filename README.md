@@ -13,7 +13,7 @@ Docker image that runs [MemPalace](https://github.com/MemPalace/mempalace) as an
 docker run -d \
   --name mempalace \
   -p 8080:8080 \
-  -v mempalace-data:/data \
+  -v mempalace-data:/root/.mempalace \
   ghcr.io/jochen/mempalace-docker:latest
 ```
 
@@ -33,7 +33,7 @@ services:
     environment:
       MCP_AUTH_TOKEN: "${MCP_AUTH_TOKEN}"   # set in .env or shell
     volumes:
-      - mempalace-data:/data
+      - mempalace-data:/root/.mempalace
 
 volumes:
   mempalace-data:
@@ -45,10 +45,16 @@ volumes:
 
 | Environment variable | Default | Description |
 |---|---|---|
-| `MEMPALACE_PALACE_PATH` | `/data` | Directory for palace files **and** ChromaDB embeddings |
 | `MCP_AUTH_TOKEN` | _(unset)_ | Bearer token for auth. If unset, auth is disabled — safe for local use, **set this for any network-exposed deployment** |
 
-Both the palace structure and the ChromaDB vector store are written to the same directory, so a single volume at `/data` persists everything.
+All MemPalace data lives under `/root/.mempalace` — mount this as a single volume to persist everything:
+
+| Path | Contents |
+|---|---|
+| `/root/.mempalace/palace/` | Drawers + ChromaDB vectors |
+| `/root/.mempalace/knowledge_graph.sqlite3` | Knowledge graph |
+| `/root/.mempalace/config.json` | Configuration |
+| `/root/.mempalace/wal/` | Write-ahead log |
 
 ---
 
@@ -96,7 +102,7 @@ MCP client (claude.ai / claude-cli)
   python -m mempalace.mcp_server
         │
         ▼
-  /data  (palace files + ChromaDB)
+  /root/.mempalace  (palace, knowledge graph, config, wal)
 ```
 
 MemPalace's MCP server speaks stdio only. `mcp-proxy` wraps it as Streamable HTTP on the internal port 8081. `auth_proxy.py` (Starlette + httpx) sits in front on port 8080, validates the Bearer token, and streams through.
