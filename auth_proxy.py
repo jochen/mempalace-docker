@@ -7,14 +7,21 @@ Accepts the token via:
 
 Checks against MCP_AUTH_TOKEN env var. Forwards matching requests to
 mcp-proxy on localhost:8081. If MCP_AUTH_TOKEN is unset, auth is skipped.
+
+Extra endpoint:
+  POST /mine  — upload conversation files, run mempalace mine, return JSON
 """
 
+import asyncio
 import os
+import re
+import shutil
+import uuid
 import httpx
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import Response, StreamingResponse
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route, Mount
 
 UPSTREAM = "http://localhost:8081"
@@ -27,17 +34,75 @@ _HOP_BY_HOP = {
     "upgrade",
 }
 
+# Serialize mine runs — ChromaDB does not support concurrent writers
+_mine_lock = asyncio.Lock()
+
+_SAFE_NAME = re.compile(r"[^a-zA-Z0-9_\-.]")
+
+
+def _check_auth(request: Request) -> bool:
+    if not AUTH_TOKEN:
+        return True
+    auth_header = request.headers.get("authorization", "")
+    query_token = request.query_params.get("token", "")
+    return auth_header == f"Bearer {AUTH_TOKEN}" or query_token == AUTH_TOKEN
+
+
+async def mine_endpoint(request: Request) -> Response:
+    if not _check_auth(request):
+        return Response("Unauthorized", status_code=401, media_type="text/plain")
+
+    form = await request.form()
+
+    wing = str(form.get("wing", "default"))
+    wing = _SAFE_NAME.sub("_", wing)[:64]  # sanitize for shell safety
+
+    uploaded = form.getlist("files")
+    if not uploaded:
+        return JSONResponse({"error": "no files uploaded"}, status_code=400)
+
+    tmpdir = f"/tmp/mine-{wing}-{uuid.uuid4().hex}"
+    os.makedirs(tmpdir, exist_ok=True)
+
+    try:
+        for upload in uploaded:
+            # Sanitize filename — strip any path components
+            safe_name = os.path.basename(upload.filename or "file")
+            safe_name = _SAFE_NAME.sub("_", safe_name) or "file"
+            dest = os.path.join(tmpdir, safe_name)
+            content = await upload.read()
+            with open(dest, "wb") as fh:
+                fh.write(content)
+
+        async with _mine_lock:
+            proc = await asyncio.create_subprocess_exec(
+                "mempalace", "mine", tmpdir,
+                "--mode", "convos",
+                "--wing", wing,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout_bytes, stderr_bytes = await proc.communicate()
+
+        result = {
+            "returncode": proc.returncode,
+            "wing": wing,
+            "files": len(uploaded),
+            "stdout": stdout_bytes.decode(errors="replace"),
+            "stderr": stderr_bytes.decode(errors="replace"),
+        }
+        status = 200 if proc.returncode == 0 else 500
+        return JSONResponse(result, status_code=status)
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 async def proxy(request: Request) -> Response:
-    # --- Auth check (header or query param) ---
-    if AUTH_TOKEN:
-        auth_header = request.headers.get("authorization", "")
-        query_token = request.query_params.get("token", "")
-        if auth_header != f"Bearer {AUTH_TOKEN}" and query_token != AUTH_TOKEN:
-            return Response("Unauthorized", status_code=401,
-                            media_type="text/plain")
+    if not _check_auth(request):
+        return Response("Unauthorized", status_code=401, media_type="text/plain")
 
-    # --- Build upstream URL (strip ?token= before forwarding) ---
+    # Build upstream URL, strip ?token= before forwarding
     path = request.url.path or "/"
     upstream_url = UPSTREAM + path
     forwarded_params = {
@@ -47,13 +112,11 @@ async def proxy(request: Request) -> Response:
         from urllib.parse import urlencode
         upstream_url += "?" + urlencode(forwarded_params)
 
-    # --- Strip hop-by-hop headers ---
     forward_headers = {
         k: v for k, v in request.headers.items()
         if k.lower() not in _HOP_BY_HOP
     }
 
-    # --- Stream to upstream (required for SSE) ---
     client = httpx.AsyncClient(timeout=None)
     upstream_request = client.build_request(
         method=request.method,
@@ -85,6 +148,7 @@ async def proxy(request: Request) -> Response:
 
 
 app = Starlette(routes=[
+    Route("/mine", mine_endpoint, methods=["POST"]),
     Mount("/", app=Starlette(routes=[
         Route("/{path:path}", proxy,
               methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]),

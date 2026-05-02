@@ -12,7 +12,8 @@ RUN pip install --no-cache-dir \
     mcp-proxy \
     starlette \
     httpx \
-    uvicorn
+    uvicorn \
+    python-multipart
 
 # Auth proxy and entrypoint script
 COPY auth_proxy.py /app/auth_proxy.py
