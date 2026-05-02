@@ -30,6 +30,9 @@ ENV MCP_AUTH_TOKEN=""
 
 VOLUME ["/data"]
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8081/')" || exit 1
+
 EXPOSE 8080
 
 # start.sh: mcp-proxy on :8081 (internal) + auth_proxy on :8080 (external)
