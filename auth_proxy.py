@@ -1,9 +1,12 @@
 """
 Lightweight auth proxy for MemPalace MCP server.
 
-Checks the Authorization: Bearer <token> header against MCP_AUTH_TOKEN.
-Forwards matching requests to mcp-proxy on localhost:8081.
-If MCP_AUTH_TOKEN is unset, auth is skipped (useful for local dev).
+Accepts the token via:
+  - Authorization: Bearer <token> header  (claude-cli, API clients)
+  - ?token=<token> query parameter        (claude.ai Web Custom Connector)
+
+Checks against MCP_AUTH_TOKEN env var. Forwards matching requests to
+mcp-proxy on localhost:8081. If MCP_AUTH_TOKEN is unset, auth is skipped.
 """
 
 import os
@@ -26,18 +29,23 @@ _HOP_BY_HOP = {
 
 
 async def proxy(request: Request) -> Response:
-    # --- Auth check ---
+    # --- Auth check (header or query param) ---
     if AUTH_TOKEN:
         auth_header = request.headers.get("authorization", "")
-        if auth_header != f"Bearer {AUTH_TOKEN}":
+        query_token = request.query_params.get("token", "")
+        if auth_header != f"Bearer {AUTH_TOKEN}" and query_token != AUTH_TOKEN:
             return Response("Unauthorized", status_code=401,
                             media_type="text/plain")
 
-    # --- Build upstream URL ---
+    # --- Build upstream URL (strip ?token= before forwarding) ---
     path = request.url.path or "/"
     upstream_url = UPSTREAM + path
-    if request.url.query:
-        upstream_url += "?" + request.url.query
+    forwarded_params = {
+        k: v for k, v in request.query_params.items() if k != "token"
+    }
+    if forwarded_params:
+        from urllib.parse import urlencode
+        upstream_url += "?" + urlencode(forwarded_params)
 
     # --- Strip hop-by-hop headers ---
     forward_headers = {
