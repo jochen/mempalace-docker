@@ -30,6 +30,8 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
+    environment:
+      MCP_AUTH_TOKEN: "${MCP_AUTH_TOKEN}"   # set in .env or shell
     volumes:
       - mempalace-data:/data
 
@@ -44,6 +46,7 @@ volumes:
 | Environment variable | Default | Description |
 |---|---|---|
 | `MEMPALACE_PALACE_PATH` | `/data` | Directory for palace files **and** ChromaDB embeddings |
+| `MCP_AUTH_TOKEN` | _(unset)_ | Bearer token for auth. If unset, auth is disabled — safe for local use, **set this for any network-exposed deployment** |
 
 Both the palace structure and the ChromaDB vector store are written to the same directory, so a single volume at `/data` persists everything.
 
@@ -53,11 +56,10 @@ Both the palace structure and the ChromaDB vector store are written to the same 
 
 ### claude.ai Web (Custom Connector)
 
-In the Claude Web UI add a custom MCP connector with the URL:
+In the Claude Web UI add a custom MCP connector:
 
-```
-http://<your-host>:8080/sse
-```
+- **URL:** `http://<your-host>:8080/sse`
+- **Auth:** Bearer token → enter the value of `MCP_AUTH_TOKEN`
 
 ### Claude CLI / claude-code
 
@@ -68,7 +70,10 @@ Add to your `~/.claude.json` or project config:
   "mcpServers": {
     "mempalace": {
       "type": "sse",
-      "url": "http://<your-host>:8080/sse"
+      "url": "http://<your-host>:8080/sse",
+      "headers": {
+        "Authorization": "Bearer <your-token>"
+      }
     }
   }
 }
@@ -80,9 +85,12 @@ Add to your `~/.claude.json` or project config:
 
 ```
 MCP client (claude.ai / claude-cli)
-        │  SSE / Streamable HTTP
+        │  SSE / Streamable HTTP  +  Authorization: Bearer <token>
         ▼
-  mcp-proxy :8080
+  auth_proxy.py :8080   ← checks MCP_AUTH_TOKEN, returns 401 on mismatch
+        │  forwards matching requests
+        ▼
+  mcp-proxy :8081       ← stdio → SSE bridge (internal only)
         │  stdio JSON-RPC
         ▼
   python -m mempalace.mcp_server
@@ -91,13 +99,14 @@ MCP client (claude.ai / claude-cli)
   /data  (palace files + ChromaDB)
 ```
 
-MemPalace's MCP server speaks stdio only. `mcp-proxy` wraps it and exposes the protocol over HTTP/SSE without any code changes to MemPalace itself.
-
----
+MemPalace's MCP server speaks stdio only. `mcp-proxy` wraps it as SSE/HTTP on the internal port 8081. `auth_proxy.py` (Starlette + httpx) sits in front on port 8080, validates the Bearer token, and streams through.
 
 ## Auth
 
-The container has no built-in authentication. Put a reverse proxy (nginx, Caddy, Traefik) in front and handle auth there — Basic Auth or bearer token at the proxy level is the recommended approach.
+Bearer token auth is built into the container via `auth_proxy.py`:
+
+- Set `MCP_AUTH_TOKEN` to enable it — any request without `Authorization: Bearer <token>` gets a `401`
+- Leave `MCP_AUTH_TOKEN` unset to disable auth (prints a warning on startup) — useful for local dev behind a firewall
 
 ---
 

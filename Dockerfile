@@ -6,17 +6,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Install MemPalace from develop branch + mcp-proxy as SSE wrapper
+# Install MemPalace from develop branch + mcp-proxy + auth proxy deps
 RUN pip install --no-cache-dir \
     "mempalace @ git+https://github.com/MemPalace/mempalace.git@develop" \
-    mcp-proxy
+    mcp-proxy \
+    starlette \
+    httpx \
+    uvicorn
+
+# Auth proxy and entrypoint script
+COPY auth_proxy.py /app/auth_proxy.py
+COPY start.sh /start.sh
+RUN chmod +x /start.sh
+
+WORKDIR /app
 
 # Palace data and ChromaDB both live under /data (single volume)
 ENV MEMPALACE_PALACE_PATH=/data
+
+# MCP_AUTH_TOKEN: set this to enable Bearer token auth.
+# If unset, the proxy forwards all requests without auth check.
+ENV MCP_AUTH_TOKEN=""
 
 VOLUME ["/data"]
 
 EXPOSE 8080
 
-# mcp-proxy wraps the stdio MCP server and exposes it as SSE/HTTP on port 8080
-ENTRYPOINT ["mcp-proxy", "--port", "8080", "--", "python", "-m", "mempalace.mcp_server"]
+# start.sh: mcp-proxy on :8081 (internal) + auth_proxy on :8080 (external)
+ENTRYPOINT ["/start.sh"]
