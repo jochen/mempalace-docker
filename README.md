@@ -1,6 +1,6 @@
 # mempalace-docker
 
-Docker image that runs [MemPalace](https://github.com/MemPalace/mempalace) as an MCP server exposed over SSE/HTTP via [mcp-proxy](https://github.com/sparfenyuk/mcp-proxy).
+Docker image that runs [MemPalace](https://github.com/MemPalace/mempalace) as an MCP server exposed over Streamable HTTP via [mcp-proxy](https://github.com/sparfenyuk/mcp-proxy).
 
 **Image:** `ghcr.io/jochen/mempalace-docker:latest`
 **Platforms:** `linux/amd64`, `linux/arm64` (Raspberry Pi)
@@ -17,7 +17,7 @@ docker run -d \
   ghcr.io/jochen/mempalace-docker:latest
 ```
 
-The MCP endpoint is available at `http://localhost:8080/sse`.
+The MCP endpoint is available at `http://localhost:8080/mcp` (Streamable HTTP).
 
 ---
 
@@ -58,7 +58,7 @@ Both the palace structure and the ChromaDB vector store are written to the same 
 
 In the Claude Web UI add a custom MCP connector:
 
-- **URL:** `http://<your-host>:8080/sse`
+- **URL:** `http://<your-host>:8080/mcp`
 - **Auth:** Bearer token → enter the value of `MCP_AUTH_TOKEN`
 
 ### Claude CLI / claude-code
@@ -69,8 +69,8 @@ Add to your `~/.claude.json` or project config:
 {
   "mcpServers": {
     "mempalace": {
-      "type": "sse",
-      "url": "http://<your-host>:8080/sse",
+      "type": "http",
+      "url": "http://<your-host>:8080/mcp",
       "headers": {
         "Authorization": "Bearer <your-token>"
       }
@@ -85,12 +85,12 @@ Add to your `~/.claude.json` or project config:
 
 ```
 MCP client (claude.ai / claude-cli)
-        │  SSE / Streamable HTTP  +  Authorization: Bearer <token>
+        │  Streamable HTTP  +  Authorization: Bearer <token>
         ▼
   auth_proxy.py :8080   ← checks MCP_AUTH_TOKEN, returns 401 on mismatch
         │  forwards matching requests
         ▼
-  mcp-proxy :8081       ← stdio → SSE bridge (internal only)
+  mcp-proxy :8081       ← stdio → Streamable HTTP bridge (internal only)
         │  stdio JSON-RPC
         ▼
   python -m mempalace.mcp_server
@@ -99,7 +99,7 @@ MCP client (claude.ai / claude-cli)
   /data  (palace files + ChromaDB)
 ```
 
-MemPalace's MCP server speaks stdio only. `mcp-proxy` wraps it as SSE/HTTP on the internal port 8081. `auth_proxy.py` (Starlette + httpx) sits in front on port 8080, validates the Bearer token, and streams through.
+MemPalace's MCP server speaks stdio only. `mcp-proxy` wraps it as Streamable HTTP on the internal port 8081. `auth_proxy.py` (Starlette + httpx) sits in front on port 8080, validates the Bearer token, and streams through.
 
 ## Auth
 
@@ -126,6 +126,12 @@ docker buildx build \
   -t mempalace-local \
   --load .
 ```
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
 
 ---
 
