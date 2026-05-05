@@ -1,14 +1,16 @@
 FROM python:3.12-slim
 
+ARG MEMPALACE_VERSION=develop
+
 # Build deps for native packages (chromadb wheels may need them on arm64)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Install MemPalace from develop branch + mcp-proxy + auth proxy deps
+# Install MemPalace + mcp-proxy + auth proxy deps
 RUN pip install --no-cache-dir \
-    "mempalace @ git+https://github.com/MemPalace/mempalace.git@develop" \
+    "mempalace @ git+https://github.com/MemPalace/mempalace.git@${MEMPALACE_VERSION}" \
     mcp-proxy \
     starlette \
     httpx \
