@@ -1,6 +1,6 @@
 # mempalace-docker
 
-Docker image that runs [MemPalace](https://github.com/MemPalace/mempalace) as an MCP server exposed over Streamable HTTP via [mcp-proxy](https://github.com/sparfenyuk/mcp-proxy).
+Docker image that runs [MemPalace](https://github.com/MemPalace/mempalace) as an MCP server exposed over Streamable HTTP, using MemPalace's native HTTP transport (MemPalace >= 3.10.0) behind an auth proxy.
 
 **Image:** `ghcr.io/jochen/mempalace-docker:latest`
 **Platforms:** `linux/amd64`, `linux/arm64` (Raspberry Pi)
@@ -28,6 +28,7 @@ services:
   mempalace:
     image: ghcr.io/jochen/mempalace-docker:latest
     restart: unless-stopped
+    init: true                              # signal forwarding + zombie reaping
     ports:
       - "8080:8080"
     environment:
@@ -48,6 +49,7 @@ volumes:
 |---|---|---|
 | `MCP_AUTH_TOKEN` | _(unset)_ | Bearer token for auth, also the password on the OAuth login page. If unset, auth is disabled — safe for local use, **set this for any network-exposed deployment** |
 | `PUBLIC_URL` | _(derived from request)_ | Public base URL (e.g. `https://memory.example.com`) used in OAuth metadata. **Set this when running behind a reverse proxy** |
+| `BACKEND_READY_TIMEOUT` | `120` | Seconds `start.sh` waits for the MemPalace backend before giving up |
 | `OAUTH_STATE_FILE` | `/root/.mempalace/oauth_state.json` | Where registered OAuth clients and tokens are stored |
 
 All MemPalace data lives under `/root/.mempalace` — mount this as a single volume to persist everything:
@@ -108,18 +110,27 @@ MCP client (claude.ai / claude-cli)
         ▼
   auth_proxy.py :8080   ← checks MCP_AUTH_TOKEN or OAuth token, 401 on mismatch
         │                  serves OAuth endpoints for claude.ai
-        │  forwards matching requests
+        │  forwards POST /mcp only, serializes palace tool calls
         ▼
-  mcp-proxy :8081       ← stdio → Streamable HTTP bridge (internal only)
-        │  stdio JSON-RPC
-        ▼
-  python -m mempalace.mcp_server
+  python -m mempalace.mcp_server --transport http
+        127.0.0.1:8081   ← MemPalace's native HTTP transport (internal only)
         │
         ▼
   /root/.mempalace  (palace, knowledge graph, config, wal)
 ```
 
-MemPalace's MCP server speaks stdio only. `mcp-proxy` wraps it as Streamable HTTP on the internal port 8081. `auth_proxy.py` (Starlette + httpx) sits in front on port 8080, validates the Bearer token, and streams through.
+MemPalace (>= 3.10.0) serves MCP over HTTP itself on the loopback port 8081 (JSON responses, no SSE, no sessions). `auth_proxy.py` (Starlette + httpx) is the only public entry point on port 8080:
+
+- validates the Bearer/OAuth token, then forwards only `POST /mcp`; the backend's internal routes (`/statusz`, `/sync/*`, `/logstream/*`) answer `404`
+- `GET`/`DELETE /mcp` answer `405` (no server-initiated stream, no session termination)
+- strips `Authorization`, `Origin`, `Referer` and the query string before forwarding, and buffers the body (the backend needs `Content-Length`)
+- serializes palace tool calls (and `/mine` runs) with one lock, because MemPalace 3.10.0's HTTP transport is not safe for concurrent palace reads; protocol methods and lock-free tools (`mempalace_kg_*`, `mempalace_event_*`, …) pass straight through so `mempalace_event_wait` long-polls don't block
+- backend down → `503` + `Retry-After: 5`, backend timeout (> 660 s) → `504`
+- `GET /healthz` (no auth) → `ok` or `503`
+
+`start.sh` starts the backend, waits until it answers a real `mempalace_status` call (not just `/healthz`), then starts `auth_proxy.py`. If either process exits, the other is stopped and the container exits, so the restart policy can recover. Stale `~/.mempalace/server/*/serverinfo.json` files (left by a crash) are removed on start. Use `init: true` in Compose for clean signal handling.
+
+`MEMPALACE_SYNC_INTERVAL=0` (no peer mesh) and `MEMPALACE_EAGER_WARMUP=1` (load the embedding model at start) are set in the image.
 
 ## Auth
 
@@ -159,7 +170,7 @@ MIT — see [LICENSE](LICENSE).
 
 ## Updates
 
-The image always installs MemPalace from the `develop` branch at build time. To get the latest MemPalace version, trigger a new build or pull the freshly built image:
+The image installs the MemPalace release pinned in `UPSTREAM_VERSION` (a daily workflow bumps it when upstream releases). Pushes to `main` publish `:latest` and `:<version>`; pushes to `feat/**` branches only publish `:test-<branch>` (e.g. `:test-feat-native-http-transport`). To get the latest image:
 
 ```bash
 docker pull ghcr.io/jochen/mempalace-docker:latest

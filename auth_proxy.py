@@ -11,11 +11,16 @@ also acts as a minimal single-user OAuth authorization server. The login page
 asks for MCP_AUTH_TOKEN; clients and refresh tokens are persisted to
 OAUTH_STATE_FILE so connectors survive container restarts.
 
-Forwards authorized requests to mcp-proxy on localhost:8081. If MCP_AUTH_TOKEN
-is unset, auth is skipped.
+Forwards authorized POST /mcp requests to MemPalace's native HTTP transport
+on 127.0.0.1:8081 (internal only). Everything else the native server offers
+(/statusz, /sync/*, /logstream/*) stays hidden behind a 404. Palace tool calls
+are serialized here because the native server breaks on concurrent reads
+(MemPalace 3.10.0); lock-free tools and protocol methods pass straight
+through. If MCP_AUTH_TOKEN is unset, auth is skipped.
 
 Extra endpoints:
   POST /mine  — upload conversation files, run mempalace mine, return JSON
+  GET /healthz — unauthenticated liveness ("ok" or 503 if the backend is down)
   OAuth: /.well-known/oauth-protected-resource[/...],
          /.well-known/oauth-authorization-server, /register, /authorize, /token
 """
@@ -37,11 +42,11 @@ import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import (
-    HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse,
+    HTMLResponse, JSONResponse, RedirectResponse, Response,
 )
 from starlette.routing import Route, Mount
 
-UPSTREAM = "http://localhost:8081"
+UPSTREAM = "http://127.0.0.1:8081"
 AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 # Public base URL as seen by clients, e.g. https://memory.example.com.
 # If unset, it is derived from the request (honours X-Forwarded-* headers).
@@ -53,15 +58,42 @@ ACCESS_TOKEN_TTL = 3600
 REFRESH_TOKEN_TTL = 90 * 24 * 3600
 AUTH_CODE_TTL = 600
 
-# Headers that must not be forwarded to the upstream
+# Headers that must not be forwarded to the upstream. The native server
+# rejects any non-loopback Host/Origin with 403, and has no business seeing
+# our credentials. content-length is recomputed by httpx from the buffered
+# body (the native server only reads Content-Length, chunked gives 400).
 _HOP_BY_HOP = {
     "host", "connection", "keep-alive", "transfer-encoding",
     "te", "trailer", "proxy-authorization", "proxy-authenticate",
-    "upgrade",
+    "upgrade", "content-length",
 }
+_NOT_FORWARDED = _HOP_BY_HOP | {"origin", "referer", "authorization", "cookie"}
 
-# Serialize mine runs — ChromaDB does not support concurrent writers
-_mine_lock = asyncio.Lock()
+# Long enough for mempalace_event_wait (long-poll up to 5 min); MemPalace's
+# own hub forwarder uses 600 s.
+_UPSTREAM_TIMEOUT = httpx.Timeout(connect=5.0, read=660.0, write=30.0, pool=30.0)
+_upstream = httpx.AsyncClient(base_url=UPSTREAM, timeout=_UPSTREAM_TIMEOUT)
+
+# Serializes palace access: POST /mcp tool calls and /mine runs. The native
+# server in MemPalace 3.10.0 returns bogus errors ("No palace found",
+# "Unknown backend") on concurrent reads, so only one palace call may be in
+# flight. /mine holds it for the whole subprocess run, because that process
+# talks to the backend directly (hub forwarding) and would bypass us.
+_palace_lock = asyncio.Lock()
+
+# Mirrors _HTTP_PROTOCOL_METHODS / _HTTP_LOCK_FREE_TOOLS in
+# mempalace/mcp_server/http.py: these never touch Chroma, and
+# mempalace_event_wait long-polls must not stall everyone else.
+_LOCK_FREE_METHODS = {"initialize", "ping", "tools/list"}
+_LOCK_FREE_TOOLS = {
+    "mempalace_event_append", "mempalace_task_create",
+    "mempalace_event_list", "mempalace_event_wait", "mempalace_event_ack",
+    "mempalace_artifact_put", "mempalace_artifact_get",
+    "mempalace_patch_submit",
+    "mempalace_kg_query", "mempalace_kg_add", "mempalace_kg_invalidate",
+    "mempalace_kg_supersede", "mempalace_kg_timeline", "mempalace_kg_stats",
+    "mempalace_mesh_peers", "mempalace_get_aaak_spec",
+}
 
 _SAFE_NAME = re.compile(r"[^a-zA-Z0-9_\-.]")
 
@@ -402,7 +434,7 @@ async def mine_endpoint(request: Request) -> Response:
             with open(dest, "wb") as fh:
                 fh.write(content)
 
-        async with _mine_lock:
+        async with _palace_lock:
             proc = await asyncio.create_subprocess_exec(
                 "mempalace", "mine", tmpdir,
                 "--mode", "convos",
@@ -426,53 +458,88 @@ async def mine_endpoint(request: Request) -> Response:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-async def proxy(request: Request) -> Response:
-    if not _check_auth(request):
-        return _unauthorized(request)
+def _needs_palace_lock(body: bytes) -> bool:
+    try:
+        message = json.loads(body)
+    except ValueError:
+        return True  # let the upstream report the parse error, but safely
+    if not isinstance(message, dict):
+        return True  # batches and oddities: fail closed
+    method = message.get("method")
+    if not isinstance(method, str):
+        return True
+    if method in _LOCK_FREE_METHODS or method.startswith("notifications/"):
+        return False
+    if method == "tools/call":
+        params = message.get("params")
+        name = params.get("name") if isinstance(params, dict) else None
+        return name not in _LOCK_FREE_TOOLS
+    return True
 
-    # Build upstream URL, strip ?token= before forwarding
-    path = request.url.path or "/"
-    upstream_url = UPSTREAM + path
-    forwarded_params = {
-        k: v for k, v in request.query_params.items() if k != "token"
-    }
-    if forwarded_params:
-        upstream_url += "?" + urlencode(forwarded_params)
 
-    forward_headers = {
-        k: v for k, v in request.headers.items()
-        if k.lower() not in _HOP_BY_HOP
-    }
-
-    client = httpx.AsyncClient(timeout=None)
-    upstream_request = client.build_request(
-        method=request.method,
-        url=upstream_url,
-        headers=forward_headers,
-        content=await request.body(),
-    )
-    upstream_response = await client.send(upstream_request, stream=True)
+async def _forward(body: bytes, headers: dict) -> Response:
+    try:
+        upstream = await _upstream.post("/mcp", content=body, headers=headers)
+    except httpx.ConnectError:
+        return Response("MemPalace backend unavailable", status_code=503,
+                        media_type="text/plain", headers={"Retry-After": "5"})
+    except httpx.TimeoutException:
+        return Response("MemPalace backend timed out", status_code=504,
+                        media_type="text/plain")
+    except httpx.HTTPError:
+        return Response("MemPalace backend error", status_code=502,
+                        media_type="text/plain")
 
     response_headers = {
-        k: v for k, v in upstream_response.headers.items()
-        if k.lower() not in _HOP_BY_HOP
+        k: v for k, v in upstream.headers.items()
+        if k.lower() not in _HOP_BY_HOP | {"server", "date"}
     }
+    # A 202 for notifications has no body and no content-type; keep it so
+    return Response(upstream.content, status_code=upstream.status_code,
+                    headers=response_headers)
 
-    async def stream_and_close():
-        try:
-            async for chunk in upstream_response.aiter_bytes():
-                yield chunk
-        finally:
-            await upstream_response.aclose()
-            await client.aclose()
 
-    return StreamingResponse(
-        stream_and_close(),
-        status_code=upstream_response.status_code,
-        headers=response_headers,
-        media_type=upstream_response.headers.get("content-type"),
-    )
+async def mcp_endpoint(request: Request) -> Response:
+    if not _check_auth(request):
+        return _unauthorized(request)
+    if request.method != "POST":
+        # Streamable HTTP: no server-initiated SSE stream (GET) and no
+        # session termination (DELETE) -> 405
+        return Response("Method Not Allowed", status_code=405,
+                        media_type="text/plain", headers={"Allow": "POST"})
 
+    # Buffer the whole body: the upstream needs Content-Length. The query
+    # string (?token=) is dropped, the native server logs request lines.
+    body = await request.body()
+    headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in _NOT_FORWARDED
+    }
+    if _needs_palace_lock(body):
+        async with _palace_lock:
+            return await _forward(body, headers)
+    return await _forward(body, headers)
+
+
+async def not_found(request: Request) -> Response:
+    # Auth first, so unauthenticated clients still get 401 + WWW-Authenticate
+    if not _check_auth(request):
+        return _unauthorized(request)
+    return Response("Not Found", status_code=404, media_type="text/plain")
+
+
+async def healthz(request: Request) -> Response:
+    try:
+        upstream = await _upstream.get("/healthz", timeout=3.0)
+        if upstream.status_code == 200:
+            return Response("ok\n", media_type="text/plain")
+    except httpx.HTTPError:
+        pass
+    return Response("backend unavailable\n", status_code=503,
+                    media_type="text/plain")
+
+
+_ALL_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 
 app = Starlette(routes=[
     Route("/.well-known/oauth-protected-resource",
@@ -487,11 +554,12 @@ app = Starlette(routes=[
     Route("/authorize", authorize_endpoint, methods=["GET", "POST"]),
     Route("/token", token_endpoint, methods=["POST"]),
     Route("/mine", mine_endpoint, methods=["POST"]),
+    Route("/healthz", healthz, methods=["GET"]),
+    Route("/mcp", mcp_endpoint, methods=_ALL_METHODS),
+    Route("/mcp/", mcp_endpoint, methods=_ALL_METHODS),
     Mount("/", app=Starlette(routes=[
-        Route("/{path:path}", proxy,
-              methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]),
-        Route("/", proxy,
-              methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]),
+        Route("/{path:path}", not_found, methods=_ALL_METHODS),
+        Route("/", not_found, methods=_ALL_METHODS),
     ])),
 ])
 

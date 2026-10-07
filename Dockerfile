@@ -8,18 +8,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Install MemPalace + mcp-proxy + auth proxy deps
+# Install MemPalace (>= 3.10.0 for --transport http) + auth proxy deps
 RUN pip install --no-cache-dir \
     "mempalace @ git+https://github.com/MemPalace/mempalace.git@${MEMPALACE_VERSION}" \
-    mcp-proxy \
-    "mcp<2" \
     starlette \
     httpx \
     uvicorn \
     python-multipart
 
-# Auth proxy and entrypoint script
+# Auth proxy, backend readiness probe and entrypoint script
 COPY auth_proxy.py /app/auth_proxy.py
+COPY backend_ready.py /app/backend_ready.py
 COPY start.sh /start.sh
 RUN chmod +x /start.sh
 
@@ -30,6 +29,10 @@ WORKDIR /app
 ENV MCP_AUTH_TOKEN=""
 # PUBLIC_URL: public HTTPS base URL, used in the OAuth metadata for claude.ai
 ENV PUBLIC_URL=""
+# No peer mesh: keep MemPalace's logstream sync thread off
+ENV MEMPALACE_SYNC_INTERVAL=0
+# Load the embedding model at startup, not on the first claude.ai call
+ENV MEMPALACE_EAGER_WARMUP=1
 
 # All MemPalace data lives under /root/.mempalace:
 #   palace/                  — drawers + ChromaDB vectors
@@ -38,10 +41,12 @@ ENV PUBLIC_URL=""
 #   wal/                     — write-ahead log
 VOLUME ["/root/.mempalace"]
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD python -c "import socket; socket.create_connection(('127.0.0.1', 8081), 3)" || exit 1
+# Backend /healthz (liveness) + auth proxy answering on :8080
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD python -c "import urllib.request as u; u.urlopen('http://127.0.0.1:8081/healthz', timeout=3); u.urlopen('http://127.0.0.1:8080/.well-known/oauth-authorization-server', timeout=3)" || exit 1
 
 EXPOSE 8080
 
-# start.sh: mcp-proxy on :8081 (internal) + auth_proxy on :8080 (external)
+# start.sh: MemPalace native HTTP on 127.0.0.1:8081 (internal)
+#           + auth_proxy on :8080 (external); exits if either dies
 ENTRYPOINT ["/start.sh"]
