@@ -30,6 +30,7 @@ import base64
 import hashlib
 import html
 import json
+import logging
 import os
 import re
 import secrets
@@ -563,7 +564,22 @@ app = Starlette(routes=[
     ])),
 ])
 
+class _RedactTokenFilter(logging.Filter):
+    """Keep ?token=<MCP_AUTH_TOKEN> out of uvicorn's access log."""
+
+    _pattern = re.compile(r"([?&]token=)[^&\s]*")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                self._pattern.sub(r"\1***", arg) if isinstance(arg, str) else arg
+                for arg in record.args
+            )
+        return True
+
+
 if __name__ == "__main__":
+    logging.getLogger("uvicorn.access").addFilter(_RedactTokenFilter())
     if not AUTH_TOKEN:
         print("WARNING: MCP_AUTH_TOKEN is not set — auth is disabled", flush=True)
     # proxy_headers: trust X-Forwarded-Proto/Host from the TLS reverse proxy
