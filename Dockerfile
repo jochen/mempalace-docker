@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir \
     "mempalace @ git+https://github.com/MemPalace/mempalace.git@${MEMPALACE_VERSION}" \
     mcp-proxy \
+    "mcp<2" \
     starlette \
     httpx \
     uvicorn \
@@ -38,7 +39,7 @@ ENV PUBLIC_URL=""
 VOLUME ["/root/.mempalace"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8081/')" || exit 1
+    CMD python -c "import socket; socket.create_connection(('127.0.0.1', 8081), 3)" || exit 1
 
 EXPOSE 8080
 
