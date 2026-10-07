@@ -27,6 +27,8 @@ WORKDIR /app
 # MCP_AUTH_TOKEN: set this to enable Bearer token auth.
 # If unset, the proxy forwards all requests without auth check.
 ENV MCP_AUTH_TOKEN=""
+# PUBLIC_URL: public HTTPS base URL, used in the OAuth metadata for claude.ai
+ENV PUBLIC_URL=""
 
 # All MemPalace data lives under /root/.mempalace:
 #   palace/                  — drawers + ChromaDB vectors
